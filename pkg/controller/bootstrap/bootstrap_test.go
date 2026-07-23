@@ -207,6 +207,9 @@ func setupForBootstrapTest(t *testing.T) (*Bootstrap, *fakeImageStreamFactory, s
 	}
 
 	bootstrap.imageStreamFactory = fakeFactory
+	bootstrap.streamClassInspector = ctrlcommon.StreamClassInspector(func(_ string) (string, error) {
+		return "", nil
+	})
 
 	return bootstrap, fakeFactory, srcDir, destDir
 }

@@ -28,6 +28,8 @@ import (
 	"github.com/openshift/machine-config-operator/pkg/osimagestream"
 	"github.com/openshift/machine-config-operator/pkg/version"
 	"github.com/spf13/cobra"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/labels"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	coreinformersv1 "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/tools/leaderelection"
@@ -100,21 +102,21 @@ func runStartCmd(_ *cobra.Command, _ []string) {
 			inspectionCache = imageutils.NewFileInspectionCache(path.Join(startOpts.streamsCache, "image-inspection.json"), 48*time.Hour)
 		}
 
+		var inspectorFactory osimagestream.ImagesInspectorFactory
+		if inspectionCache != nil {
+			inspectorFactory = osimagestream.NewCachedImagesInspectorFactory(
+				&osimagestream.DefaultImagesInspectorFactory{},
+				inspectionCache,
+			)
+		} else {
+			inspectorFactory = &osimagestream.DefaultImagesInspectorFactory{}
+		}
+
 		// OSImageStream must be the first controller to run: the blocking
 		// EnsureOSImageStream call guarantees the CR exists before any other
 		// controller starts, since render, node, and template depend on it
 		// for OS image URLs.
 		if osimagestream.IsFeatureEnabled(ctrlctx.FeatureGatesHandler) {
-			var inspectorFactory osimagestream.ImagesInspectorFactory
-			if inspectionCache != nil {
-				inspectorFactory = osimagestream.NewCachedImagesInspectorFactory(
-					&osimagestream.DefaultImagesInspectorFactory{},
-					inspectionCache,
-				)
-			} else {
-				inspectorFactory = &osimagestream.DefaultImagesInspectorFactory{}
-			}
-
 			osImageStreamCtrl := osistreamctrl.New(
 				ctrlctx.InformerFactory.Machineconfiguration().V1().OSImageStreams(),
 				ctrlctx.InformerFactory.Machineconfiguration().V1().ControllerConfigs(),
@@ -149,6 +151,10 @@ func runStartCmd(_ *cobra.Command, _ []string) {
 		}
 
 		go ctrlcommon.StartMetricsListener(startOpts.promMetricsListenAddress, ctrlctx.Stop, ctrlcommon.RegisterMCCMetrics, startOpts.tlsMinVersion, startOpts.tlsCipherSuites)
+
+		// Build a stream class inspector for runc-on-RHEL10 blocking.
+		// TODO(OCP 5.3): Remove when runc is removed.
+		ctrlctx.StreamClassInspector = buildStreamClassInspector(ctrlctx, inspectorFactory)
 
 		controllers := createControllers(ctrlctx, inspectionCache)
 		draincontroller := drain.New(
@@ -295,6 +301,14 @@ func createControllers(ctx *ctrlcommon.ControllerContext, inspectionCache *image
 		ctx.ClientBuilder.KubeClientOrDie("render-controller"),
 		ctx.ClientBuilder.MachineConfigClientOrDie("render-controller"),
 		ctx.FeatureGatesHandler,
+		ctx.StreamClassInspector,
+	)
+	renderCtrl.SetInspectorCacheSyncs(
+		ctx.OpenShiftConfigKubeNamespacedInformerFactory.Core().V1().Secrets().Informer().HasSynced,
+		ctx.ConfigInformerFactory.Config().V1().Images().Informer().HasSynced,
+		ctx.OperatorInformerFactory.Operator().V1alpha1().ImageContentSourcePolicies().Informer().HasSynced,
+		ctx.ConfigInformerFactory.Config().V1().ImageDigestMirrorSets().Informer().HasSynced,
+		ctx.ConfigInformerFactory.Config().V1().ImageTagMirrorSets().Informer().HasSynced,
 	)
 	if inspectionCache != nil {
 		inspectionCache.RegisterEvicter(renderCtrl)
@@ -366,4 +380,77 @@ func createControllers(ctx *ctrlcommon.ControllerContext, inspectionCache *image
 	)
 
 	return controllers
+}
+
+// buildStreamClassInspector constructs a StreamClassInspector from the
+// informer factories on the controller context. The inspector resolves registry
+// mirror rules and pull secrets at call time via informer-backed listers.
+// Caching is handled by the inspectorFactory (backed by FileInspectionCache
+// when available).
+// TODO(OCP 5.3): Remove when runc is removed.
+func buildStreamClassInspector(ctrlctx *ctrlcommon.ControllerContext, inspectorFactory osimagestream.ImagesInspectorFactory) ctrlcommon.StreamClassInspector {
+	ccLister := ctrlctx.InformerFactory.Machineconfiguration().V1().ControllerConfigs().Lister()
+	secretLister := ctrlctx.OpenShiftConfigKubeNamespacedInformerFactory.Core().V1().Secrets().Lister()
+	imgLister := ctrlctx.ConfigInformerFactory.Config().V1().Images().Lister()
+	icspLister := ctrlctx.OperatorInformerFactory.Operator().V1alpha1().ImageContentSourcePolicies().Lister()
+	idmsLister := ctrlctx.ConfigInformerFactory.Config().V1().ImageDigestMirrorSets().Lister()
+	itmsLister := ctrlctx.ConfigInformerFactory.Config().V1().ImageTagMirrorSets().Lister()
+
+	return ctrlcommon.StreamClassInspector(func(imageURL string) (string, error) {
+		inspectCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		cc, err := ccLister.Get(ctrlcommon.ControllerConfigName)
+		if err != nil {
+			return "", fmt.Errorf("failed to get controller config: %w", err)
+		}
+		secret, err := secretLister.Secrets(ctrlcommon.OpenshiftConfigNamespace).Get(ctrlcommon.GlobalPullSecretName)
+		if err != nil {
+			return "", fmt.Errorf("failed to get pull secret: %w", err)
+		}
+		imgCfg, err := imgLister.Get("cluster")
+		if err != nil && !apierrors.IsNotFound(err) {
+			return "", fmt.Errorf("failed to get cluster image config: %w", err)
+		}
+
+		icspRules, err := icspLister.List(labels.Everything())
+		if err != nil {
+			if !apierrors.IsNotFound(err) {
+				return "", fmt.Errorf("failed to list ICSP rules: %w", err)
+			}
+			icspRules = nil
+		}
+		idmsRules, err := idmsLister.List(labels.Everything())
+		if err != nil {
+			if !apierrors.IsNotFound(err) {
+				return "", fmt.Errorf("failed to list IDMS rules: %w", err)
+			}
+			idmsRules = nil
+		}
+		itmsRules, err := itmsLister.List(labels.Everything())
+		if err != nil {
+			if !apierrors.IsNotFound(err) {
+				return "", fmt.Errorf("failed to list ITMS rules: %w", err)
+			}
+			itmsRules = nil
+		}
+
+		sysCtxFactory := func() (*imageutils.SysContext, error) {
+			builder := imageutils.NewSysContextBuilder().
+				WithSecret(secret).
+				WithControllerConfig(cc)
+
+			registriesConfig, err := imageutils.GenerateRegistriesConfig(imgCfg, icspRules, idmsRules, itmsRules)
+			if err != nil {
+				return nil, fmt.Errorf("failed to generate registries config: %w", err)
+			}
+			if registriesConfig != nil {
+				builder.WithRegistriesConfig(registriesConfig)
+			}
+			return builder.Build()
+		}
+
+		inspector := inspectorFactory.ForContext(sysCtxFactory)
+		return osimagestream.InspectStreamClassWith(inspectCtx, inspector, imageURL)
+	})
 }

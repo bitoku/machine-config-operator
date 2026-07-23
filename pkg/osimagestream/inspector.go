@@ -9,7 +9,11 @@ import (
 	"strings"
 
 	"github.com/containers/common/pkg/retry"
+	apicfgv1 "github.com/openshift/api/config/v1"
+	mcfgv1 "github.com/openshift/api/machineconfiguration/v1"
+	apioperatorsv1alpha1 "github.com/openshift/api/operator/v1alpha1"
 	"github.com/openshift/machine-config-operator/pkg/imageutils"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 )
 
@@ -107,6 +111,65 @@ func (i *ImagesInspectorImpl) FetchImageFile(ctx context.Context, image, path st
 	return imageutils.ReadImageFileContent(ctx, sysCtx.SysContext, image, func(header *tar.Header) bool {
 		return targetHeaderPath == strings.TrimLeft(header.Name, "./")
 	}, newImageInspectionRetryOptions())
+}
+
+// InspectStreamClassWith inspects a container image and returns its OS stream
+// class (e.g. "rhel-9", "rhel-10") from the image's labels. Returns ("", nil)
+// when the image has no stream class label.
+// TODO(OCP 5.3): Remove when runc is removed.
+func InspectStreamClassWith(ctx context.Context, inspector ImagesInspector, imageURL string) (string, error) {
+	results, err := inspector.Inspect(ctx, imageURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to inspect OS image: %w", err)
+	}
+	if len(results) == 0 {
+		return "", fmt.Errorf("no inspection result for OS image")
+	}
+	if results[0].Error != nil {
+		return "", fmt.Errorf("failed to inspect OS image: %w", results[0].Error)
+	}
+	if results[0].InspectInfo == nil {
+		return "", nil
+	}
+
+	extractor := NewImageStreamExtractor()
+	imageData := extractor.GetImageData(imageURL, results[0].InspectInfo.Labels)
+	if imageData == nil {
+		return "", nil
+	}
+	return imageData.Stream, nil
+}
+
+// InspectStreamClassWithMirrors builds an image system context with registry mirror
+// rules applied, then inspects the container image to determine its OS stream class.
+// TODO(OCP 5.3): Remove when runc is removed.
+func InspectStreamClassWithMirrors(
+	ctx context.Context,
+	secret *corev1.Secret,
+	cc *mcfgv1.ControllerConfig,
+	imgCfg *apicfgv1.Image,
+	icspRules []*apioperatorsv1alpha1.ImageContentSourcePolicy,
+	idmsRules []*apicfgv1.ImageDigestMirrorSet,
+	itmsRules []*apicfgv1.ImageTagMirrorSet,
+	imageURL string,
+) (string, error) {
+	sysCtxFactory := func() (*imageutils.SysContext, error) {
+		builder := imageutils.NewSysContextBuilder().
+			WithSecret(secret).
+			WithControllerConfig(cc)
+
+		registriesConfig, err := imageutils.GenerateRegistriesConfig(imgCfg, icspRules, idmsRules, itmsRules)
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate registries config: %w", err)
+		}
+		if registriesConfig != nil {
+			builder.WithRegistriesConfig(registriesConfig)
+		}
+
+		return builder.Build()
+	}
+
+	return InspectStreamClassWith(ctx, NewImagesInspector(sysCtxFactory), imageURL)
 }
 
 // ImagesInspectorFactory creates ImagesInspector instances.

@@ -53,6 +53,11 @@ type Bootstrap struct {
 	pullSecretFile string
 	// OSImageStreams factory. Used for testing purposes.
 	imageStreamFactory osimagestream.ImageStreamFactory
+	// streamClassInspector overrides the default inspector. Used for testing.
+	// The real inspector requires pull secrets, ControllerConfig, and mirror
+	// rules that are only available after manifests are parsed inside Run(),
+	// so it cannot be constructed at New() time.
+	streamClassInspector ctrlcommon.StreamClassInspector
 }
 
 // New returns controller for bootstrap
@@ -360,7 +365,19 @@ func (b *Bootstrap) Run(destDir string) error {
 		klog.Infof("Successfully created %d pre-built image component MachineConfigs for hybrid OCL.", len(preBuiltImageMCs))
 	}
 
-	fpools, gconfigs, err := render.RunBootstrap(pools, configs, cconfig, osImageStream)
+	// Build an inspector that RunBootstrap can use to check the stream class
+	// of an overriding OSImageURL (e.g. from a pre-built image MachineConfig).
+	// TODO(OCP 5.3): remove this once runc is removed.
+	inspector := b.streamClassInspector
+	if inspector == nil {
+		inspector = func(imageURL string) (string, error) {
+			inspectCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			return osimagestream.InspectStreamClassWithMirrors(inspectCtx, pullSecret, cconfig, imgCfg, icspRules, idmsRules, itmsRules, imageURL)
+		}
+	}
+
+	fpools, gconfigs, err := render.RunBootstrap(pools, configs, cconfig, osImageStream, inspector)
 	if err != nil {
 		return err
 	}

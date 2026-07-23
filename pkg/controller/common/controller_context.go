@@ -69,6 +69,9 @@ type ControllerContext struct {
 
 	FeatureGatesHandler FeatureGatesHandler
 
+	// TODO(OCP 5.3): Remove when runc is removed.
+	StreamClassInspector StreamClassInspector
+
 	AvailableResources map[schema.GroupVersionResource]bool
 
 	Stop <-chan struct{}

@@ -83,7 +83,10 @@ func (f *fixture) newController() *Controller {
 	c := New(i.Machineconfiguration().V1().MachineConfigPools(), i.Machineconfiguration().V1().MachineConfigs(),
 		i.Machineconfiguration().V1().ControllerConfigs(), i.Machineconfiguration().V1().ContainerRuntimeConfigs(),
 		i.Machineconfiguration().V1().KubeletConfigs(), oi.Operator().V1().MachineConfigurations(),
-		i.Machineconfiguration().V1().OSImageStreams(), k8sfake.NewSimpleClientset(), f.client, f.fgHandler)
+		i.Machineconfiguration().V1().OSImageStreams(),
+		k8sfake.NewSimpleClientset(), f.client, f.fgHandler,
+		StreamClassInspector(func(_ string) (string, error) { return "", nil }),
+	)
 
 	c.mcpListerSynced = alwaysReady
 	c.mcListerSynced = alwaysReady
@@ -96,6 +99,8 @@ func (f *fixture) newController() *Controller {
 	defer close(stopCh)
 	i.Start(stopCh)
 	i.WaitForCacheSync(stopCh)
+	oi.Start(stopCh)
+	oi.WaitForCacheSync(stopCh)
 
 	for _, c := range f.ccLister {
 		i.Machineconfiguration().V1().ControllerConfigs().Informer().GetIndexer().Add(c)
@@ -281,11 +286,13 @@ func TestCreatesGeneratedMachineConfig(t *testing.T) {
 	mcp := helpers.NewMachineConfigPool("test-cluster-master", helpers.MasterSelector, nil, "")
 	files := []ign3types.File{{
 		Node: ign3types.Node{
-			Path: "/dummy/0",
+			Path:      "/dummy/0",
+			Overwrite: helpers.BoolToPtr(false),
 		},
 	}, {
 		Node: ign3types.Node{
-			Path: "/dummy/1",
+			Path:      "/dummy/1",
+			Overwrite: helpers.BoolToPtr(false),
 		},
 	}}
 	mcs := []*mcfgv1.MachineConfig{
@@ -1015,6 +1022,125 @@ func makeCRIODropIn(runtime string) string {
 	return "[crio.runtime]\ndefault_runtime = \"" + runtime + "\"\n"
 }
 
+// TestValidateNoRuncFromOSImageURL verifies that runc is blocked on RHEL 10 streams detected via OSImageURL inspection.
+func TestValidateNoRuncFromOSImageURL(t *testing.T) {
+	tests := []struct {
+		name         string
+		mc           *mcfgv1.MachineConfig
+		streamClass  string
+		inspectErr   error
+		expectError  bool
+		expectErrMsg string
+	}{
+		{
+			name:        "empty OSImageURL skips check",
+			mc:          helpers.NewMachineConfig("rendered-worker", nil, "", nil),
+			streamClass: "rhel-10",
+			expectError: false,
+		},
+		{
+			name: "runc on RHEL 10 should error",
+			mc: func() *mcfgv1.MachineConfig {
+				mc := helpers.NewMachineConfig("rendered-worker", nil, "", []ign3types.File{
+					helpers.CreateEncodedIgn3File("/etc/crio/crio.conf.d/00-default", makeCRIODropIn("runc"), 0644),
+				})
+				mc.Spec.OSImageURL = "quay.io/openshift/rhcos@sha256:abc123"
+				return mc
+			}(),
+			streamClass: "rhel-10",
+			expectError: true,
+		},
+		{
+			name: "crun on RHEL 10 should succeed",
+			mc: func() *mcfgv1.MachineConfig {
+				mc := helpers.NewMachineConfig("rendered-worker", nil, "", []ign3types.File{
+					helpers.CreateEncodedIgn3File("/etc/crio/crio.conf.d/00-default", makeCRIODropIn("crun"), 0644),
+				})
+				mc.Spec.OSImageURL = "quay.io/openshift/rhcos@sha256:abc123"
+				return mc
+			}(),
+			streamClass: "rhel-10",
+			expectError: false,
+		},
+		{
+			name: "runc on RHEL 9 should succeed",
+			mc: func() *mcfgv1.MachineConfig {
+				mc := helpers.NewMachineConfig("rendered-worker", nil, "", []ign3types.File{
+					helpers.CreateEncodedIgn3File("/etc/crio/crio.conf.d/00-default", makeCRIODropIn("runc"), 0644),
+				})
+				mc.Spec.OSImageURL = "quay.io/openshift/rhcos@sha256:abc123"
+				return mc
+			}(),
+			streamClass: "rhel-9",
+			expectError: false,
+		},
+		{
+			name: "runc on CentOS 10 should error",
+			mc: func() *mcfgv1.MachineConfig {
+				mc := helpers.NewMachineConfig("rendered-worker", nil, "", []ign3types.File{
+					helpers.CreateEncodedIgn3File("/etc/crio/crio.conf.d/00-default", makeCRIODropIn("runc"), 0644),
+				})
+				mc.Spec.OSImageURL = "quay.io/openshift/scos@sha256:abc123"
+				return mc
+			}(),
+			streamClass: "centos-10",
+			expectError: true,
+		},
+		{
+			name: "inspection failure should fail closed",
+			mc: func() *mcfgv1.MachineConfig {
+				mc := helpers.NewMachineConfig("rendered-worker", nil, "", []ign3types.File{
+					helpers.CreateEncodedIgn3File("/etc/crio/crio.conf.d/00-default", makeCRIODropIn("runc"), 0644),
+				})
+				mc.Spec.OSImageURL = "quay.io/openshift/rhcos@sha256:abc123"
+				return mc
+			}(),
+			inspectErr:   fmt.Errorf("network error"),
+			expectError:  true,
+			expectErrMsg: "network error",
+		},
+		{
+			name: "no stream class label should succeed",
+			mc: func() *mcfgv1.MachineConfig {
+				mc := helpers.NewMachineConfig("rendered-worker", nil, "", []ign3types.File{
+					helpers.CreateEncodedIgn3File("/etc/crio/crio.conf.d/00-default", makeCRIODropIn("runc"), 0644),
+				})
+				mc.Spec.OSImageURL = "quay.io/openshift/rhcos@sha256:abc123"
+				return mc
+			}(),
+			streamClass: "",
+			expectError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pool := &mcfgv1.MachineConfigPool{
+				ObjectMeta: metav1.ObjectMeta{Name: "worker"},
+			}
+
+			ctrl := &Controller{
+				imageInspector: StreamClassInspector(func(_ string) (string, error) {
+					return tt.streamClass, tt.inspectErr
+				}),
+			}
+
+			err := ctrl.validateNoRuncFromOSImageURL(pool, tt.mc)
+			if tt.expectError {
+				require.Error(t, err)
+				if tt.expectErrMsg != "" {
+					assert.Contains(t, err.Error(), tt.expectErrMsg)
+				} else {
+					assert.Contains(t, err.Error(), "runc")
+					assert.Contains(t, err.Error(), "not available")
+				}
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
 func TestValidateNoRuncOnRHEL10(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -1130,8 +1256,102 @@ func TestRunBootstrapBlocksRuncOnRHEL10(t *testing.T) {
 		[]*mcfgv1.MachineConfig{runcMC},
 		cc,
 		osImageStream,
+		nil,
 	)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "runc")
 	assert.Contains(t, err.Error(), "not available")
 }
+
+// TestRunBootstrapBlocksRuncOnRHEL10ViaOSImageURLOverride verifies that bootstrap rendering
+// rejects runc when a MachineConfig overrides OSImageURL to a RHEL 10 image.
+func TestRunBootstrapBlocksRuncOnRHEL10ViaOSImageURLOverride(t *testing.T) {
+	pool := &mcfgv1.MachineConfigPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "worker"},
+		Spec: mcfgv1.MachineConfigPoolSpec{
+			MachineConfigSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"machineconfiguration.openshift.io/role": "worker"},
+			},
+		},
+	}
+
+	cc := newControllerConfig(ctrlcommon.ControllerConfigName)
+
+	runcMC := helpers.NewMachineConfig("99-worker-runc",
+		map[string]string{"machineconfiguration.openshift.io/role": "worker"},
+		"",
+		[]ign3types.File{
+			helpers.CreateEncodedIgn3File("/etc/crio/crio.conf.d/99-runc",
+				makeCRIODropIn("runc"), 0644),
+		})
+
+	crunMC := helpers.NewMachineConfig("99-worker-crun",
+		map[string]string{"machineconfiguration.openshift.io/role": "worker"},
+		"",
+		[]ign3types.File{
+			helpers.CreateEncodedIgn3File("/etc/crio/crio.conf.d/99-crun",
+				makeCRIODropIn("crun"), 0644),
+		})
+
+	overrideURL := "quay.io/custom/rhcos@sha256:abc123"
+	overrideMC := &mcfgv1.MachineConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "prebuilt-image-worker",
+			Labels: map[string]string{"machineconfiguration.openshift.io/role": "worker"},
+		},
+		Spec: mcfgv1.MachineConfigSpec{
+			OSImageURL: overrideURL,
+		},
+	}
+
+	tests := []struct {
+		name           string
+		runtimeMC      *mcfgv1.MachineConfig
+		inspectorClass string
+		expectError    bool
+	}{
+		{
+			name:           "runc with RHEL 10 override should error",
+			runtimeMC:      runcMC,
+			inspectorClass: "rhel-10",
+			expectError:    true,
+		},
+		{
+			name:           "crun with RHEL 10 override should succeed",
+			runtimeMC:      crunMC,
+			inspectorClass: "rhel-10",
+			expectError:    false,
+		},
+		{
+			name:           "runc with RHEL 9 override should succeed",
+			runtimeMC:      runcMC,
+			inspectorClass: "rhel-9",
+			expectError:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inspector := StreamClassInspector(func(imageURL string) (string, error) {
+				assert.Equal(t, overrideURL, imageURL)
+				return tt.inspectorClass, nil
+			})
+
+			_, _, err := RunBootstrap(
+				[]*mcfgv1.MachineConfigPool{pool},
+				[]*mcfgv1.MachineConfig{tt.runtimeMC, overrideMC},
+				cc,
+				nil,
+				inspector,
+			)
+			if tt.expectError {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "runc")
+				assert.Contains(t, err.Error(), "not available")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+

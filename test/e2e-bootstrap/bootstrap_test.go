@@ -524,6 +524,7 @@ func newTestFixture(t *testing.T, cfg *rest.Config, objs []runtime.Object) *fixt
 	ctx, stop := context.WithCancel(context.Background())
 	cb := clients.BuilderFromConfig(cfg)
 	ctrlctx := ctrlcommon.CreateControllerContext(ctx, cb)
+	ctrlctx.StreamClassInspector = func(_ string) (string, error) { return "", nil }
 
 	clientSet := framework.NewClientSetFromConfig(cfg)
 
@@ -616,6 +617,7 @@ func createControllers(ctx *ctrlcommon.ControllerContext) []ctrlcommon.Controlle
 			ctx.ClientBuilder.KubeClientOrDie("render-controller"),
 			ctx.ClientBuilder.MachineConfigClientOrDie("render-controller"),
 			ctx.FeatureGatesHandler,
+			ctx.StreamClassInspector,
 		),
 		// The node controller consumes data written by the above
 		node.New(
